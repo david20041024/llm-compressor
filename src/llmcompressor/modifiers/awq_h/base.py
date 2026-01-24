@@ -535,7 +535,7 @@ class AWQHModifier(Modifier, QuantizationMixin):
     self,
     mapping: ResolvedMapping,
     fp16_outputs: list[torch.Tensor],
-) -> torch.Tensor:
+    ) -> torch.Tensor:
     """
     簡化版本：直接使用固定比例 0.5 計算縮放因子
     """
