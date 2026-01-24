@@ -590,7 +590,12 @@ class AWQNModifier(Modifier, QuantizationMixin):
         """
         Log the error metrics (initial error, best error, reduction).
         """
-
+        # ============ 新增的檢查 ============
+        # 如果沒有誤差指標，跳過
+        if not self._error_metrics or len(self._error_metrics) == 0:
+            logger.debug("No error metrics to log (grid search was skipped)")
+            return
+        # ====================================
         # Prepare data for saving
         metrics_data = {
             "quantization_config": {
