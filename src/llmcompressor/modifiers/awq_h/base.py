@@ -536,41 +536,38 @@ class AWQHModifier(Modifier, QuantizationMixin):
     mapping: ResolvedMapping,
     fp16_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
-    """
-    簡化版本：直接使用固定比例 0.5 計算縮放因子
-    """
-    device = get_execution_device(mapping.parent)
+        device = get_execution_device(mapping.parent)
 
-    # 獲取激活均值
-    x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
-    
-    # 固定比例 0.5
-    ratio = 0.5
-    
-    # 計算縮放因子
-    if self.duo_scaling:
-        w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
-        scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(min=1e-4)
-    else:
-        scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
-    
-    # 正則化
-    scales = scales / (scales.max() * scales.min()).sqrt()
-    
-    # 清理 NaN 和 inf
-    scales[torch.isinf(scales)] = 1
-    scales[torch.isnan(scales)] = 1
-    
-    # ============ 簡單的 column 調整 ============
-    scales = self._simple_column_check(scales, x_mean)
-    # ==========================================
-    
-    logger.debug(
-        f"Direct scaling for {mapping.smooth_name}: "
-        f"min={scales.min():.4f}, max={scales.max():.4f}"
-    )
+        # 獲取激活均值
+        x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
+        
+        # 固定比例 0.5
+        ratio = 0.5
+        
+        # 計算縮放因子
+        if self.duo_scaling:
+            w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
+            scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(min=1e-4)
+        else:
+            scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+        
+        # 正則化
+        scales = scales / (scales.max() * scales.min()).sqrt()
+        
+        # 清理 NaN 和 inf
+        scales[torch.isinf(scales)] = 1
+        scales[torch.isnan(scales)] = 1
+        
+        # ============ 簡單的 column 調整 ============
+        scales = self._simple_column_check(scales, x_mean)
+        # ==========================================
+        
+        logger.debug(
+            f"Direct scaling for {mapping.smooth_name}: "
+            f"min={scales.min():.4f}, max={scales.max():.4f}"
+        )
 
-    return scales.detach().cpu()
+        return scales.detach().cpu()
 
 @torch.no_grad()
 def _simple_column_check(
