@@ -569,40 +569,40 @@ class AWQHModifier(Modifier, QuantizationMixin):
 
         return scales.detach().cpu()
 
-@torch.no_grad()
-def _simple_column_check(
-    self,
-    scales: torch.Tensor,
-    x_mean: torch.Tensor,
-) -> torch.Tensor:
-    """
-    最簡單的 column 檢查：前一個跟後一個比
-    """
-    if len(scales) <= 1:
-        return scales
-    
-    adjusted_scales = scales.clone()
-    
-    for i in range(1, len(scales)):
-        # 計算比值：X_mean[i-1]/s[i-1] 和 X_mean[i]/s[i]
-        prev_ratio = x_mean[i-1] / (scales[i-1] + 1e-8)
-        curr_ratio = x_mean[i] / (scales[i] + 1e-8)
+    @torch.no_grad()
+    def _simple_column_check(
+        self,
+        scales: torch.Tensor,
+        x_mean: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        最簡單的 column 檢查：前一個跟後一個比
+        """
+        if len(scales) <= 1:
+            return scales
         
-        # 計算變化比例
-        ratio_change = curr_ratio / (prev_ratio + 1e-8)
+        adjusted_scales = scales.clone()
         
-        # 如果不在 0.65-1.35 範圍內，直接 clamp
-        if ratio_change < 0.65:
-            # 太小了，要讓 curr_ratio 變大 → 減小 scales[i]
-            target_ratio = prev_ratio * 0.65  # 設為下限
-            adjusted_scales[i] = x_mean[i] / (target_ratio + 1e-8)
+        for i in range(1, len(scales)):
+            # 計算比值：X_mean[i-1]/s[i-1] 和 X_mean[i]/s[i]
+            prev_ratio = x_mean[i-1] / (scales[i-1] + 1e-8)
+            curr_ratio = x_mean[i] / (scales[i] + 1e-8)
             
-        elif ratio_change > 1.35:
-            # 太大了，要讓 curr_ratio 變小 → 增大 scales[i]
-            target_ratio = prev_ratio * 1.35  # 設為上限
-            adjusted_scales[i] = x_mean[i] / (target_ratio + 1e-8)
-    
-    return adjusted_scales
+            # 計算變化比例
+            ratio_change = curr_ratio / (prev_ratio + 1e-8)
+            
+            # 如果不在 0.65-1.35 範圍內，直接 clamp
+            if ratio_change < 0.65:
+                # 太小了，要讓 curr_ratio 變大 → 減小 scales[i]
+                target_ratio = prev_ratio * 0.65  # 設為下限
+                adjusted_scales[i] = x_mean[i] / (target_ratio + 1e-8)
+                
+            elif ratio_change > 1.35:
+                # 太大了，要讓 curr_ratio 變小 → 增大 scales[i]
+                target_ratio = prev_ratio * 1.35  # 設為上限
+                adjusted_scales[i] = x_mean[i] / (target_ratio + 1e-8)
+        
+        return adjusted_scales
 
     @torch.no_grad()
     def _compute_loss(
