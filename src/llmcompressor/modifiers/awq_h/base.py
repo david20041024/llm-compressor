@@ -532,272 +532,80 @@ class AWQHModifier(Modifier, QuantizationMixin):
         ]
 
     def _compute_best_scale(
-        self,
-        mapping: ResolvedMapping,
-        fp16_outputs: list[torch.Tensor],
-    ) -> torch.Tensor:
-        """
-        Select best scales for a given mapping in a grid search
-        Best scales are those that minimize MSE loss of quantized weight
-            outputs compared to fp16_outputs
+    self,
+    mapping: ResolvedMapping,
+    fp16_outputs: list[torch.Tensor],
+) -> torch.Tensor:
+    """
+    簡化版本：直接使用固定比例 0.5 計算縮放因子
+    """
+    device = get_execution_device(mapping.parent)
 
-        L(s) = || Q(W * s) (s^-1 * X) - W * X ||
-        Q: weight quantization function | _pseudo_quantize_tensor(W * s)
-        X: inputs from calib dataset    | X
-        W: original weights in FP16     | layer
-        s: per channel scaling factor   | s^-1 * X
+    # 獲取激活均值
+    x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
+    
+    # 固定比例 0.5
+    ratio = 0.5
+    
+    # 計算縮放因子
+    if self.duo_scaling:
+        w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
+        scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(min=1e-4)
+    else:
+        scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+    
+    # 正則化
+    scales = scales / (scales.max() * scales.min()).sqrt()
+    
+    # 清理 NaN 和 inf
+    scales[torch.isinf(scales)] = 1
+    scales[torch.isnan(scales)] = 1
+    
+    # ============ 簡單的 column 調整 ============
+    scales = self._simple_column_check(scales, x_mean)
+    # ==========================================
+    
+    logger.debug(
+        f"Direct scaling for {mapping.smooth_name}: "
+        f"min={scales.min():.4f}, max={scales.max():.4f}"
+    )
 
-        :param mapping: best scales will be found for the ResolvedMapping.
-        :param fp16_outputs: output of mapping.parent in unquantized case,
-            one tensor for each batch.
-        :return: tensor of best scales, one for each channel
-        """
-        history = []
-        best_ratio = -1
-        best_scales = None
-        best_error = float("inf")
-        initial_error = None
+    return scales.detach().cpu()
 
-        org_sd = {
-            k: v.cpu()
-            for k, v in mapping.parent.state_dict().items()
-            if v.device != torch.device("meta")
-        }
-
-        device = get_execution_device(mapping.parent)
-
-        x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
-        if self.duo_scaling:
-            w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
-
-        match self.duo_scaling:
-            # if self.duo_scaling is "both", perform half the grid search with
-            # duo_scaling off and half with duo_scaling on
-            case "both":
-                n_grid = int(self.n_grid / 2)
-                duo_scalings = [False, True]
-            case _:
-                n_grid = self.n_grid
-                duo_scalings = [self.duo_scaling]
-
-        # Where appropriate, replace observers with memoryless_minmax
-        # for duration of grid search
-        balance_layers_to_patch = [
-            balance_layer
-            for balance_layer in mapping.balance_layers
-            if hasattr(balance_layer, "quantization_scheme")
-            and hasattr(balance_layer.quantization_scheme, "weights")
-        ]
-        with patch_attrs(
-            balance_layers_to_patch,
-            "weight_observer",
-            [
-                Observer.load_from_registry(
-                    "memoryless_minmax",
-                    base_name="weight",
-                    args=balance_layer.quantization_scheme.weights,
-                    module=balance_layer,
-                )
-                for balance_layer in balance_layers_to_patch
-            ],
-        ):
-            total_iterations = n_grid * len(duo_scalings)
-            pbar = tqdm(
-                product(range(n_grid), duo_scalings),
-                total=total_iterations,
-                desc=f"Grid search for {mapping.smooth_name}",
-                leave=False,
-            )
-            for grid_idx, use_duo_scaling in pbar:
-                # create new scales
-                ratio = grid_idx / n_grid
-
-                # NOTE: s^-1 * x is fused here, according to paper
-                if use_duo_scaling:
-                    scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(
-                        min=1e-4
-                    )
-                else:
-                    scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
-                scales = scales / (scales.max() * scales.min()).sqrt()
-                _scalesview = scales.view(1, -1).to(device)
-
-                # avoid scaling values that overflow
-                scales[torch.isinf(scales)] = 1
-                scales[torch.isnan(scales)] = 1
-
-                # Q(W * s)
-                for balance_layer in balance_layers_to_patch:
-                    if not hasattr(balance_layer, "quantization_scheme") or not hasattr(
-                        balance_layer.quantization_scheme, "weights"
-                    ):
-                        continue
-
-                    w_qscheme = balance_layer.quantization_scheme.weights
-                    balance_layer.weight.mul_(_scalesview)
-                    # For TENSOR_GROUP (nvfp4), need to calculate global scale
-                    should_calculate_gparam = (
-                        w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
-                    )
-                    call_observer(
-                        balance_layer,
-                        "weight",
-                        balance_layer.weight,
-                        should_calculate_gparam=should_calculate_gparam,
-                    )
-                    update_offload_parameter(
-                        balance_layer,
-                        "weight",
-                        forward_quantize(
-                            balance_layer,
-                            balance_layer.weight.data,
-                            "weight",
-                            w_qscheme,
-                        )
-                        / _scalesview,
-                    )
-
-                # Apply fused global scales for TENSOR_GROUP during grid search
-                # to match inference behavior
-                if balance_layers_to_patch and all(
-                    getattr(layer.quantization_scheme.weights, "strategy", None)
-                    == QuantizationStrategy.TENSOR_GROUP
-                    for layer in balance_layers_to_patch
-                ):
-                    update_fused_layer_weight_global_scales(mapping.parent)
-
-                # W * X
-                int_w_outputs = self._run_samples(mapping.parent)
-
-                # compute mean squared error (L2 norm)
-                loss = self._compute_loss(fp16_outputs, int_w_outputs)
-
-                if initial_error is None:
-                    initial_error = loss
-
-                history.append(
-                    {"ratio": ratio, "duo_scaling": use_duo_scaling, "error": loss}
-                )
-                if loss < best_error:
-                    best_error = loss
-                    best_ratio = ratio
-                    best_scales = scales.clone()
-                pbar.set_postfix({"best_error": f"{best_error:.3e}"})
-
-                mapping.parent.load_state_dict(org_sd, strict=False)
-
-        if best_ratio == -1:
-            logger.debug(history)
-            raise Exception(
-                "No finite loss was found in best scalesgrid search. This typically "
-                "means NaN values are appearing in the forward pass of the parent "
-                "module. If you encounter this error, raise an issue at "
-                "https://github.com/vllm-project/llm-compressor/issues"
-            )
-
-        err_reduction = best_error / initial_error if initial_error > 0 else 1.0
-        logger.debug(
-            f"AWQ grid search for {mapping.smooth_name}: "
-            f"initial error = {initial_error:.3e}, "
-            f"best error = {best_error:.3e}, "
-            f"error reduction rate (best/initial) = {err_reduction * 100:.3f}%"
-        )
-
-        # Store error metrics for this layer
-        self._error_metrics.append(
-            {
-                "layer_name": mapping.smooth_name,
-                "parent_name": mapping.parent_name,
-                "initial_error": initial_error,
-                "best_error": best_error,
-                "reduction": err_reduction,
-            }
-        )
-
-        assert (
-            torch.isnan(best_scales).sum() == 0
-        ), f"Nan found in scales: {best_scales}"
-
-        # Fine-tune scales before applying
-        best_scales = self._adjust_protection_scales(
-            best_scales, mapping, fp16_outputs, mapping.balance_layers
-        )
-
-        return best_scales.detach().cpu()
-
-    @torch.no_grad()
-    def _adjust_protection_scales(
-        self,
-        scales: torch.Tensor,
-        mapping: ResolvedMapping,
-        fp16_outputs: list[torch.Tensor],
-        balance_layers: list[Module],
-        lower_bound: float = 0.65,
-        upper_bound: float = 1.35,
-    ) -> torch.Tensor:
-        """
-        Fine-tune protection scales after grid search.
-        Adjusts scales based on activation consistency between adjacent channels.
+@torch.no_grad()
+def _simple_column_check(
+    self,
+    scales: torch.Tensor,
+    x_mean: torch.Tensor,
+) -> torch.Tensor:
+    """
+    最簡單的 column 檢查：前一個跟後一個比
+    """
+    if len(scales) <= 1:
+        return scales
+    
+    adjusted_scales = scales.clone()
+    
+    for i in range(1, len(scales)):
+        # 計算比值：X_mean[i-1]/s[i-1] 和 X_mean[i]/s[i]
+        prev_ratio = x_mean[i-1] / (scales[i-1] + 1e-8)
+        curr_ratio = x_mean[i] / (scales[i] + 1e-8)
         
-        Logic:
-        - First channel (index 0) remains unchanged
-        - For channels i >= 1: check if X_mean[i-1]/s[i] is within 
-          [X_mean[i-1]/s[i-1] * lower_bound, X_mean[i-1]/s[i-1] * upper_bound]
-        - If out of range, adjust s[i] to bring ratio back into range
-        - No global clamping applied
-
-        :param scales: initial scales from grid search
-        :param mapping: the ResolvedMapping being processed
-        :param fp16_outputs: output of mapping.parent in unquantized case
-        :param balance_layers: layers to apply scales to
-        :param lower_bound: lower bound ratio (default 0.65 = 65%)
-        :param upper_bound: upper bound ratio (default 1.35 = 135%)
-        :return: adjusted scales tensor
-        """
-        adjusted_scales = scales.clone()
-
-        smooth_name = mapping.smooth_name
-        if smooth_name not in self._smooth_activation_means:
-            return adjusted_scales
-
-        x_mean = self._smooth_activation_means[smooth_name][0].to(adjusted_scales.device)
+        # 計算變化比例
+        ratio_change = curr_ratio / (prev_ratio + 1e-8)
         
-        # Ensure x_mean has compatible shape
-        if x_mean.shape[0] != adjusted_scales.shape[0]:
-            logger.warning(
-                f"Activation mean shape {x_mean.shape} does not match scales shape "
-                f"{adjusted_scales.shape}, skipping adjustment"
-            )
-            return adjusted_scales
-
-        # First channel remains unchanged
-        # For subsequent channels, adjust based on previous channel ratio
-        for i in range(1, adjusted_scales.shape[0]):
-            # Reference ratio from previous channel: x_mean[i-1] / s[i-1]
-            prev_ratio = x_mean[i-1] / (adjusted_scales[i - 1] + 1e-8)
+        # 如果不在 0.65-1.35 範圍內，直接 clamp
+        if ratio_change < 0.65:
+            # 太小了，要讓 curr_ratio 變大 → 減小 scales[i]
+            target_ratio = prev_ratio * 0.65  # 設為下限
+            adjusted_scales[i] = x_mean[i] / (target_ratio + 1e-8)
             
-            # Current ratio: x_mean[i-1] / s[i]
-            current_ratio = x_mean[i - 1] / (adjusted_scales[i] + 1e-8)
-            
-            # Expected range for current ratio
-            min_allowed = prev_ratio * lower_bound
-            max_allowed = prev_ratio * upper_bound
-            
-            # Adjust s[i] if current_ratio is out of range
-            if current_ratio < min_allowed:
-                # current_ratio too small → s[i] too large → decrease s[i]
-                adjusted_scales[i] = x_mean[i - 1] / (min_allowed + 1e-8)
-            elif current_ratio > max_allowed:
-                # current_ratio too large → s[i] too small → increase s[i]
-                adjusted_scales[i] = x_mean[i - 1] / (max_allowed + 1e-8)
-        
-        logger.debug(
-            f"Protection scales adjusted for {mapping.smooth_name}: "
-            f"min={adjusted_scales.min():.4f}, max={adjusted_scales.max():.4f}, "
-            f"mean={adjusted_scales.mean():.4f}"
-        )
-
-        return adjusted_scales
+        elif ratio_change > 1.35:
+            # 太大了，要讓 curr_ratio 變小 → 增大 scales[i]
+            target_ratio = prev_ratio * 1.35  # 設為上限
+            adjusted_scales[i] = x_mean[i] / (target_ratio + 1e-8)
+    
+    return adjusted_scales
 
     @torch.no_grad()
     def _compute_loss(
