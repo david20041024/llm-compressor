@@ -121,9 +121,6 @@ class GPTQAWQModifier(Modifier, QuantizationMixin):
         # apply config to model and prepare calibration hooks
         if QuantizationMixin.has_config(self):
             QuantizationMixin.initialize_quantization(self, state.model)
-        logger.debug(
-            f"GPTQ for AWQ_N"
-        )
         # 驗證duo_scaling只與per-channel量化策略兼容
         if self.duo_scaling:
             for _, module in match_named_modules(
@@ -246,7 +243,7 @@ class GPTQAWQModifier(Modifier, QuantizationMixin):
             quant_args = getattr_chain(module, "quantization_scheme.weights")
 
             logger.info(f"Quantizing {name} using {num_samples} samples")
-            
+            logger.info(f"GPTQ for AWQ_N")
             # Apply AWQ duo-scaling if enabled
             scale_view = None
             
