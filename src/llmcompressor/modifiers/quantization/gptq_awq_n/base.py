@@ -29,10 +29,10 @@ from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
 from llmcompressor.sentinel import Sentinel
 from llmcompressor.utils.metric_logging import CompressionLogger
 
-__all__ = ["GPTQModifier"]
+__all__ = ["GPTQAWQModifier"]
 
 
-class GPTQModifier(Modifier, QuantizationMixin):
+class GPTQAWQModifier(Modifier, QuantizationMixin):
     """
     Implements the GPTQ algorithm with AWQ duo-scaling enhancement.
     
