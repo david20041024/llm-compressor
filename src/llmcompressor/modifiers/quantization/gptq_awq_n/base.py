@@ -335,7 +335,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
         # AWQ duo-scaling formula: s = (x^ratio) / (w^(1-ratio))
         # Fixed ratio=0.5 for balanced scaling
         scales = (act_mean.pow(ratio) / (weight_mean.pow(1 - ratio) + 1e-8)).clamp(min=1e-8)
-        
+        logger.debug(f"DEBUG: raw scales min/max = {scales.min():.6f}/{scales.max():.6f}")
         # Normalize for numerical stability
         scale_max = scales.max()
         scale_min = scales.min()
