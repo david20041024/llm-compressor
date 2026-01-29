@@ -233,7 +233,7 @@ class GPTQAWQModifier(Modifier, QuantizationMixin):
                     group_mean = H_diag[start:end].mean() + 1e-8
 
                     # 計算這組的縮放 factor (AWQ: pow(-1/4))
-                    group_scale = group_mean.pow(-1/4)
+                    group_scale = group_mean.pow(-1/2)
                     reverse[g] = 1.0 / group_scale
                     # 對這組的所有 weight column 套用相同 scale
                     weight_scaling[start:end] = group_scale
