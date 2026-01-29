@@ -220,16 +220,28 @@ class GPTQAWQModifier(Modifier, QuantizationMixin):
             ):
                                 # 1️⃣ 取 Hessian
                 H = self._hessians[module]  # shape [out, in]
+                H_diag = H.diagonal()
+                shape_in = H.shape[0]
+                num_groups = (shape_in + self.block_size - 1) // self.block_size
+                weight_scaling = torch.empty(shape_in, device=H.device)
+                reverse = torch.empty(num_groups, device=H.device)
+                for g in range(num_groups):
+                    start = g * self.block_size
+                    end = min((g+1) * self.block_size, shape_in)
 
-                # 2️⃣ 計算每 column 的平均 (或 RMS)
-                H_col_mean = H.mean(dim=0)  # column-wise average
+                    # 取這組的 Hessian 對角線平均
+                    group_mean = H_diag[start:end].mean() + 1e-8
 
-                # 3️⃣ 對 Hessian 做 column-wise 正規化
-                H_col_rsqrt = torch.sqrt(H_col_mean).reciprocal()  # 1 / sqrt(mean)
-                self._hessians[module] = H * H_col_rsqrt[None, :]  # broadcast
+                    # 計算這組的縮放 factor (AWQ: pow(-1/4))
+                    group_scale = group_mean.pow(-1/4)
+                    reverse[g] = 1.0 / group_scale
+                    # 對這組的所有 weight column 套用相同 scale
+                    weight_scaling[start:end] = group_scale
+                weight_scaling = weight_scaling / (weight_scaling.max() * weight_scaling.min()).sqrt()
+                module.weight.data *= weight_scaling[None, :]
 
-                # 4️⃣ 對 weight 做對應 scaling
-                module.weight.data *= torch.sqrt(H_col_rsqrt)[None, :]  # 四次根 = sqrt(sqrt)
+                H_scaled = H / weight_scaling[:, None] / weight_scaling[None, :]
+                self._hessians[module] = H_scaled
 
                 loss, quantized_weight, scale, zero_point, g_idx = quantize_weight(
                     module=module,
@@ -239,8 +251,8 @@ class GPTQAWQModifier(Modifier, QuantizationMixin):
                     percdamp=self.dampening_frac,
                 )
                 comp_logger.set_loss(loss)
-                
-            module.weight.data /= torch.sqrt(H_col_rsqrt)[None, :]
+
+            scale = scale * reverse
             update_offload_parameter(module, "weight", quantized_weight)
             update_offload_parameter(module, "weight_scale", scale)
             update_offload_parameter(module, "weight_zero_point", zero_point)
