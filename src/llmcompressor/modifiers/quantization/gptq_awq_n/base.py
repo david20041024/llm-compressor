@@ -237,7 +237,7 @@ class GPTQAWQModifier(Modifier, QuantizationMixin):
                     reverse[g] = 1.0 / group_scale
                     # 對這組的所有 weight column 套用相同 scale
                     weight_scaling[start:end] = group_scale
-                weight_scaling = weight_scaling.clamp(min=1e-2, max=1e2)
+                weight_scaling = weight_scaling.clamp(min=1e-1, max=1e1)
                 module.weight.data *= weight_scaling[None, :]
 
                 H_scaled = H / weight_scaling[:, None] / weight_scaling[None, :]
