@@ -274,7 +274,7 @@ class AWQModifier(Modifier, QuantizationMixin):
         if not self.ended_:
             self.on_end(state, None)
 
-        self._log_error_metrics()
+        # self._log_error_metrics()
 
         self._parent_args_cache.clear()
         self._smooth_activation_means.clear()
@@ -535,13 +535,12 @@ class AWQModifier(Modifier, QuantizationMixin):
         fp16_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
         """
-        簡單網格搜索：6個固定ratio值
+        簡單網格搜索：3個固定ratio值
         """
         device = get_execution_device(mapping.parent)
         x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
-        
-        # 6個固定ratio值
-        ratios = [0.366, 0.4, 0.433, 0.466, 0.5, 0.533]
+
+        ratios = [0.35, 0.4, 0.45]
         
         # 保存原始權重
         org_sd = {
