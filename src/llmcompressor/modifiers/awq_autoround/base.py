@@ -613,15 +613,17 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
                 scales = scales / (scales.max() * scales.min()).sqrt()
                 _scalesview = scales.view(1, -1).to(device)
                 
-                # 2. 量化權重：Q(W * s)
+                # 2. 量化權重：Q(W * s) - 這裡需要特別處理梯度問題
                 for balance_layer in balance_layers_to_patch:
                     if not hasattr(balance_layer, "quantization_scheme"):
                         continue
 
                     w_qscheme = balance_layer.quantization_scheme.weights
                     
-                    # 臨時修改權重：W * s
-                    balance_layer.weight.mul_(_scalesview)
+                    # ✅ 權重操作在 no_grad 中進行
+                    with torch.no_grad():
+                        # 臨時修改權重：W * s
+                        balance_layer.weight.data.mul_(_scalesview)  # ✅ 使用 .data
                     
                     # 計算 global scale
                     should_calculate_gparam = (
@@ -635,17 +637,18 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
                     )
                     
                     # 量化並恢復權重：Q(W * s) / s
-                    update_offload_parameter(
-                        balance_layer,
-                        "weight",
-                        forward_quantize(
+                    with torch.no_grad():  # ✅ 量化操作也在 no_grad 中
+                        update_offload_parameter(
                             balance_layer,
-                            balance_layer.weight.data,
                             "weight",
-                            w_qscheme,
+                            forward_quantize(
+                                balance_layer,
+                                balance_layer.weight.data,  # ✅ 使用 .data
+                                "weight",
+                                w_qscheme,
+                            )
+                            / _scalesview,
                         )
-                        / _scalesview,
-                    )
 
                 # 3. 對於 TENSOR_GROUP，應用 fused global scales
                 if balance_layers_to_patch and all(
