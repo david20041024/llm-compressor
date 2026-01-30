@@ -705,12 +705,12 @@ class AWQModifier(Modifier, QuantizationMixin):
             fixed_ratio = self.ratio
         
             # Calculate scales directly from x_mean with fixed ratio
-            scales = x_mean.pow(fixed_ratio).clamp(min=1e-4).view(-1)
-            scales = scales / (scales.max() * scales.min()).sqrt()
+            best_scales = x_mean.pow(fixed_ratio).clamp(min=1e-4).view(-1)
+            best_scales = best_scales / (best_scales.max() * best_scales.min()).sqrt()
             
             # Clean up invalid values
-            scales[torch.isinf(scales)] = 1
-            scales[torch.isnan(scales)] = 1
+            best_scales[torch.isinf(best_scales)] = 1
+            best_scales[torch.isnan(best_scales)] = 1
             
             logger.debug(
                 f"AWQ scales for {mapping.smooth_name}: "
