@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from llmcompressor.core import Event, EventType, State
 from llmcompressor.modifiers import Modifier
-from llmcompressor.modifiers.awq_n.mappings import (
+from llmcompressor.modifiers.awq.mappings import (
     AWQMapping,
     ResolvedMapping,
     get_layer_mappings_from_architecture,
@@ -46,13 +46,11 @@ from llmcompressor.utils.pytorch.module import (
     get_module_to_name_dict,
 )
 
-__all__ = ["AWQNModifier"]
+__all__ = ["AWQModifier"]
 
 
-class AWQNModifier(Modifier, QuantizationMixin):
+class AWQModifier(Modifier, QuantizationMixin):
     """
-    Custom AWQ Modifier (awq_h) - Based on Activation-Weighted Quantization algorithm.
-    
     Implements the AWQ (Activation-Weighted Quantization) algorithm,
     as described in https://arxiv.org/pdf/2306.00978. The algorithm
     significantly reduces quantization error by protecting only 1%
@@ -70,7 +68,7 @@ class AWQNModifier(Modifier, QuantizationMixin):
 
     example recipe:
     ```yaml
-    AWQHModifier:
+    AWQModifier:
       mappings:
         - smooth_layer: "re:.*self_attn_layer_norm"
           balance_layers: ["re:.*q_proj", "re:.*k_proj", "re:.*v_proj"]
@@ -140,7 +138,7 @@ class AWQNModifier(Modifier, QuantizationMixin):
         at the possible cost of slightly worse scales, this can be decreased.
         Defaults to 20
     """
-
+    
     # Allow arbitrary types because AWQMapping has fields of type torch.nn.Module
     model_config: ConfigDict = ConfigDict(arbitrary_types_allowed=True)
 
@@ -532,38 +530,214 @@ class AWQNModifier(Modifier, QuantizationMixin):
         ]
 
     def _compute_best_scale(
-    self,
-    mapping: ResolvedMapping,
-    fp16_outputs: list[torch.Tensor],
+        self,
+        mapping: ResolvedMapping,
+        fp16_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
+        """
+        同時比較四種方法，選擇損失最小的方法：
+        1. 法一：解 X_mean^ratio = 2
+        2. 法二：ratio = 0.4
+        3. 法三：ratio = 0.5  
+        4. 法四：ratio = 0.6
+        """
         device = get_execution_device(mapping.parent)
-
-        # 獲取激活均值
+        
+        # 獲取激活值均值
         x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
         
-        # 固定比例 0.5
-        ratio = 0.5
-        
-        # 計算縮放因子
-        if self.duo_scaling:
+        # 如果需要 duo_scaling，獲取權重均值
+        if self.duo_scaling and self.duo_scaling != "both":
             w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
-            scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(min=1e-4)
+            has_weight_mean = True
         else:
-            scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+            w_mean = None
+            has_weight_mean = False
+        
+        # 保存原始權重
+        org_sd = {
+            k: v.cpu()
+            for k, v in mapping.parent.state_dict().items()
+                if v.device != torch.device("meta")
+        }
+        
+        # 替換 observers 為 memoryless_minmax
+        balance_layers_to_patch = [
+            balance_layer
+            for balance_layer in mapping.balance_layers
+            if hasattr(balance_layer, "quantization_scheme")
+            and hasattr(balance_layer.quantization_scheme, "weights")
+        ]
+        
+        # 方法定義
+        methods = []
+        
+        # 法一：解 X_mean^ratio = 2
+        # 計算：ratio = log2 / log(X_mean_max)
+        x_mean_max = x_mean.max().item()
+        if x_mean_max > 1.0:
+            ratio1 = math.log(2) / math.log(x_mean_max)
+            ratio1 = max(0.0, min(1.0, ratio1))  # 限制在 [0, 1]
+            methods.append(("法一: X_max^ratio=2", ratio1))
+        else:
+            methods.append(("法一: X_max^ratio=2", 0.5))  # 備用
+        
+        # 法二：ratio = 0.4
+        methods.append(("法二: ratio=0.4", 0.4))
+        
+        # 法三：ratio = 0.5
+        methods.append(("法三: ratio=0.5", 0.5))
+        
+        # 法四：ratio = 0.6
+        methods.append(("法四: ratio=0.6", 0.6))
+        
+        # 如果有權重均值，也考慮 duo_scaling 的情況
+        if has_weight_mean:
+            # 計算 w_mean 的最大值
+            w_mean_max = w_mean.max().item()
+            
+            # 法一-duo：解 (X_mean^ratio)/(w_mean^(1-ratio)) = 2
+            # 這需要解方程：ratio*log(X_max) - (1-ratio)*log(w_max) = log(2)
+            # 解：ratio = (log(2) + log(w_max)) / (log(X_max) + log(w_max))
+            if x_mean_max > 0 and w_mean_max > 0:
+                numerator = math.log(2) + math.log(w_mean_max)
+                denominator = math.log(x_mean_max) + math.log(w_mean_max)
+                if denominator != 0:
+                    ratio1_duo = numerator / denominator
+                    ratio1_duo = max(0.0, min(1.0, ratio1_duo))
+                    methods.append(("法一-duo: (X^r)/(w^(1-r))=2", ratio1_duo))
+            
+            # 其他方法的 duo 版本
+            methods.append(("法二-duo: ratio=0.4", 0.4))
+            methods.append(("法三-duo: ratio=0.5", 0.5))
+            methods.append(("法四-duo: ratio=0.6", 0.6))
+        
+        # 測試所有方法
+        best_method = None
+        best_ratio = 0.5
+        best_scales = None
+        best_loss = float('inf')
+        
+        logger.info(f"比較 {len(methods)} 種方法 for {mapping.smooth_name}:")
+        
+        with patch_attrs(
+            balance_layers_to_patch,
+            "weight_observer",
+            [
+                Observer.load_from_registry(
+                    "memoryless_minmax",
+                    base_name="weight",
+                    args=balance_layer.quantization_scheme.weights,
+                    module=balance_layer,
+                )
+                for balance_layer in balance_layers_to_patch
+            ],
+        ):
+            for method_name, ratio in methods:
+                # 1. 計算 scales
+                ratio_tensor = torch.tensor(ratio, device=device)
+                
+                if has_weight_mean and "duo" in method_name:
+                    # duo_scaling: s = x^ratio / w^(1-ratio)
+                    scales = (x_mean.pow(ratio_tensor) / (w_mean.pow(1 - ratio_tensor) + 1e-4)).clamp(min=1e-4)
+                else:
+                    # 只使用激活值: s = x^ratio
+                    scales = x_mean.pow(ratio_tensor).clamp(min=1e-4)
+                
+                # 正則化 scales
+                scales = scales / (scales.max() * scales.min()).sqrt()
+                _scalesview = scales.view(1, -1).to(device)
+                
+                # 2. 量化權重
+                for balance_layer in balance_layers_to_patch:
+                    if not hasattr(balance_layer, "quantization_scheme"):
+                        continue
+
+                    w_qscheme = balance_layer.quantization_scheme.weights
+                    balance_layer.weight.mul_(_scalesview)
+                    
+                    # 計算 global scale
+                    should_calculate_gparam = (
+                        w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
+                    )
+                    call_observer(
+                        balance_layer,
+                        "weight",
+                        balance_layer.weight,
+                        should_calculate_gparam=should_calculate_gparam,
+                    )
+                    
+                    # 量化並恢復權重
+                    update_offload_parameter(
+                        balance_layer,
+                        "weight",
+                        forward_quantize(
+                            balance_layer,
+                            balance_layer.weight.data,
+                            "weight",
+                            w_qscheme,
+                        )
+                        / _scalesview,
+                    )
+
+                # 3. 對於 TENSOR_GROUP，應用 fused global scales
+                if balance_layers_to_patch and all(
+                    getattr(layer.quantization_scheme.weights, "strategy", None)
+                    == QuantizationStrategy.TENSOR_GROUP
+                    for layer in balance_layers_to_patch
+                ):
+                    update_fused_layer_weight_global_scales(mapping.parent)
+
+                # 4. 計算量化輸出和損失
+                int_w_outputs = self._run_samples(mapping.parent)
+                loss = self._compute_loss(fp16_outputs, int_w_outputs)
+                
+                # 5. 恢復原始權重
+                mapping.parent.load_state_dict(org_sd, strict=False)
+                
+                # 記錄結果
+                logger.info(f"  {method_name}: ratio={ratio:.3f}, loss={loss:.3e}, scales_max={scales.max().item():.3f}")
+                
+                if loss < best_loss:
+                    best_loss = loss
+                    best_method = method_name
+                    best_ratio = ratio
+                    best_scales = scales.clone()
+        
+        # 使用最佳方法計算最終的 scales
+        ratio_tensor = torch.tensor(best_ratio, device=device)
+        
+        if has_weight_mean and "duo" in best_method:
+            final_scales = (x_mean.pow(ratio_tensor) / (w_mean.pow(1 - ratio_tensor) + 1e-4)).clamp(min=1e-4)
+        else:
+            final_scales = x_mean.pow(ratio_tensor).clamp(min=1e-4)
         
         # 正則化
-        scales = scales / (scales.max() * scales.min()).sqrt()
+        final_scales = final_scales / (final_scales.max() * final_scales.min()).sqrt()
         
-        # 清理 NaN 和 inf
-        scales[torch.isinf(scales)] = 1
-        scales[torch.isnan(scales)] = 1
+        # 清理數值
+        final_scales[torch.isnan(final_scales)] = 1.0
+        final_scales[torch.isinf(final_scales)] = 1.0
+        final_scales = torch.clamp(final_scales, min=1e-4)
         
-        logger.debug(
-            f"Direct scaling for {mapping.smooth_name}: "
-            f"min={scales.min():.4f}, max={scales.max():.4f}"
+        logger.info(
+            f"選擇 {best_method} for {mapping.smooth_name}: "
+            f"ratio = {best_ratio:.3f}, "
+            f"loss = {best_loss:.3e}, "
+            f"scales range = [{final_scales.min().item():.3e}, {final_scales.max().item():.3e}]"
         )
 
-        return scales.detach().cpu()
+        # 記錄
+        self._error_metrics.append({
+            "layer_name": mapping.smooth_name,
+            "method": best_method,
+            "final_ratio": best_ratio,
+            "final_loss": best_loss,
+            "scales_max": final_scales.max().item(),
+            "scales_min": final_scales.min().item(),
+        })
+
+        return final_scales.detach().cpu()
 
     @torch.no_grad()
     def _compute_loss(
@@ -590,12 +764,7 @@ class AWQNModifier(Modifier, QuantizationMixin):
         """
         Log the error metrics (initial error, best error, reduction).
         """
-        # ============ 新增的檢查 ============
-        # 如果沒有誤差指標，跳過
-        if not self._error_metrics or len(self._error_metrics) == 0:
-            logger.debug("No error metrics to log (grid search was skipped)")
-            return
-        # ====================================
+
         # Prepare data for saving
         metrics_data = {
             "quantization_config": {

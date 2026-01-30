@@ -138,7 +138,7 @@ class AWQModifier(Modifier, QuantizationMixin):
         at the possible cost of slightly worse scales, this can be decreased.
         Defaults to 20
     """
-
+    
     # Allow arbitrary types because AWQMapping has fields of type torch.nn.Module
     model_config: ConfigDict = ConfigDict(arbitrary_types_allowed=True)
 
