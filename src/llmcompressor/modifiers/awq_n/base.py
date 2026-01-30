@@ -529,7 +529,7 @@ class AWQModifier(Modifier, QuantizationMixin):
             for output in outputs
         ]
 
-    def _compute_best_scale_simple_grid(
+    def _compute_best_scale(
         self,
         mapping: ResolvedMapping,
         fp16_outputs: list[torch.Tensor],
