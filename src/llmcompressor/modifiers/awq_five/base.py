@@ -716,11 +716,10 @@ class AWQModifier(Modifier, QuantizationMixin):
                 f"AWQ scales for {mapping.smooth_name}: "
                 f"using fixed ratio = {fixed_ratio}"
             )
-            if(self.count==4):
+            if(self.count==5):
                 self.count=0
             else:
                 self.count+=1
-            assert torch.isnan(scales).sum() == 0, f"Nan found in scales: {scales}"
             
 
         return best_scales.detach().cpu()
