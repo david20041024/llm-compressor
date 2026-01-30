@@ -534,7 +534,7 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
         fp16_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
         """
-        使用 SignSGD 優化 ratio 參數，固定 200 步
+        使用 SignSGD 優化 ratio 參數，固定 200 步，但加入早停
         """
         device = get_execution_device(mapping.parent)
 
@@ -585,6 +585,13 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
                 for balance_layer in balance_layers_to_patch
             ],
         ), torch.enable_grad():  # 重要：啟用梯度計算
+            # 早停參數
+            best_ratio = ratio.clone().detach()  # 保存最佳 ratio
+            best_loss = float('inf')  # 最佳損失
+            patience = 15  # 連續多少次沒有改善就停止
+            patience_counter = 0  # 沒有改善的計數器
+            min_delta = 1e-6  # 最小改善值
+            
             # 固定 200 步 SignSGD 優化
             total_iterations = 200
             pbar = tqdm(
@@ -663,6 +670,7 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
 
                 # 5. 使用修改後的 _compute_loss_tensor 方法計算損失
                 loss_tensor = self._compute_loss_tensor(fp16_outputs, int_w_outputs)
+                current_loss = loss_tensor.item()  # ✅ 獲取當前損失值
                 
                 # 6. 反向傳播
                 loss_tensor.backward()
@@ -688,14 +696,35 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
                 # 8. 恢復原始權重
                 mapping.parent.load_state_dict(org_sd, strict=False)
                 
+                # ✅ 早停檢查
+                if current_loss < best_loss - min_delta:  # 有顯著改善
+                    best_loss = current_loss
+                    best_ratio = ratio.clone().detach()
+                    patience_counter = 0  # 重置計數器
+                    logger.debug(f"Iter {iteration}: Loss improved to {best_loss:.3e}, ratio={best_ratio.item():.3f}")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        logger.info(f"Early stopping at iteration {iteration} (no improvement for {patience} iterations)")
+                        logger.info(f"Best loss: {best_loss:.3e}, Best ratio: {best_ratio.item():.3f}")
+                        break  # ✅ 提早結束
+                
+                # ✅ 每步顯示詳細信息
                 pbar.set_postfix({
                     "ratio": f"{ratio_clamped.item():.3f}",
-                    "loss": f"{loss_tensor.item():.3e}",
+                    "loss": f"{current_loss:.3e}",
+                    "best": f"{best_loss:.3e}",
+                    "patience": f"{patience_counter}/{patience}",
                     "lr": f"{lr:.4f}"
                 })
 
-        # 使用最後的 ratio 計算最終的 scales
-        final_ratio = ratio.detach().clamp(min=0.0, max=1.0).item()
+            # 如果沒有提前停止，完成所有迭代
+            if patience_counter < patience:
+                logger.debug(f"Completed all {total_iterations} iterations")
+                logger.info(f"Final loss: {current_loss:.3e}, Final ratio: {ratio.item():.3f}")
+
+        # ✅ 使用最佳的 ratio（不是最後的 ratio）
+        final_ratio = best_ratio.clamp(min=0.0, max=1.0).item()
         
         if has_weight_mean:
             final_scales = (x_mean.pow(final_ratio) / (w_mean.pow(1 - final_ratio) + 1e-4)).clamp(min=1e-4)
@@ -710,9 +739,10 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
         final_scales[torch.isinf(final_scales)] = 1.0
         final_scales = torch.clamp(final_scales, min=1e-4)
         
-        logger.debug(
+        logger.info(
             f"AWQ SignSGD for {mapping.smooth_name}: "
-            f"final ratio = {final_ratio:.3f}, "
+            f"best ratio = {final_ratio:.3f}, "
+            f"best loss = {best_loss:.3e}, "
             f"scales range = [{final_scales.min().item():.3e}, {final_scales.max().item():.3e}]"
         )
 
@@ -720,7 +750,9 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
         self._error_metrics.append({
             "layer_name": mapping.smooth_name,
             "final_ratio": final_ratio,
-            "final_loss": loss_tensor.item() if 'loss_tensor' in locals() else 0.0,
+            "final_loss": best_loss,
+            "iterations_used": iteration + 1 if 'iteration' in locals() else total_iterations,
+            "early_stopped": patience_counter >= patience
         })
 
         return final_scales.detach().cpu()
