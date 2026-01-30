@@ -528,7 +528,7 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
             for output in outputs
         ]
 
-   def _compute_best_scale(
+    def _compute_best_scale(
         self,
         mapping: ResolvedMapping,
         fp16_outputs: list[torch.Tensor],
