@@ -422,7 +422,6 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
                 "forward",
             )
 
-    @torch.no_grad()
     def _apply_smoothing(self, model: Module) -> None:
         """
         Calculate the best scaling factors for each layer to smooth activations and
@@ -529,22 +528,34 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
             for output in outputs
         ]
 
-    @torch.no_grad()
     def _compute_best_scale(
         self,
         mapping: ResolvedMapping,
         fp16_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
         """
-        使用 SignSGD 優化替代網格搜索，固定 200 步
-        
-        L(s) = || Q(W * s) (s^-1 * X) - W * X ||
-        使用 SignSGD 最小化 L(s)
+        使用 SignSGD 優化 ratio 參數，固定 200 步
         """
-        history = []
-        best_scales = None
-        best_error = float("inf")
-        initial_error = None
+        device = get_execution_device(mapping.parent)
+
+        # 獲取激活值均值
+        x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
+        
+        # 如果需要 duo_scaling，獲取權重均值
+        if self.duo_scaling and self.duo_scaling != "both":
+            w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
+            has_weight_mean = True
+        else:
+            w_mean = None
+            has_weight_mean = False
+        
+        # 初始化 ratio 參數
+        ratio = torch.tensor(0.5, device=device, requires_grad=True)
+        
+        # 學習率
+        lr = 0.005
+        momentum = 0.9
+        momentum_buffer = torch.zeros_like(ratio)
 
         # 保存原始權重用於恢復
         org_sd = {
@@ -552,30 +563,6 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
             for k, v in mapping.parent.state_dict().items()
             if v.device != torch.device("meta")
         }
-
-        device = get_execution_device(mapping.parent)
-
-        # 獲取激活值均值
-        x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
-        
-        # 初始化 scales
-        if self.duo_scaling and self.duo_scaling != "both":
-            w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
-            # 基於權重和激活初始化
-            scales = (x_mean.pow(0.5) / (w_mean.pow(0.5) + 1e-4)).clamp(min=1e-4)
-        else:
-            # 只使用激活值
-            scales = x_mean.pow(0.5).clamp(min=1e-4).view(-1)
-        
-        # 正則化初始值
-        scales = scales / (scales.max() * scales.min()).sqrt()
-        # 設置 requires_grad 為 True 以進行梯度優化
-        scales = scales.clone().requires_grad_(True)
-        
-        # 學習率和動量參數
-        lr = 0.005
-        momentum = 0.9
-        momentum_buffer = torch.zeros_like(scales)
 
         # 替換 observers 為 memoryless_minmax
         balance_layers_to_patch = [
@@ -597,29 +584,38 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
                 )
                 for balance_layer in balance_layers_to_patch
             ],
-        ):
+        ), torch.enable_grad():  # 重要：啟用梯度計算
             # 固定 200 步 SignSGD 優化
             total_iterations = 200
             pbar = tqdm(
                 range(total_iterations),
                 total=total_iterations,
-                desc=f"SignSGD for {mapping.smooth_name}",
+                desc=f"SignSGD ratio for {mapping.smooth_name}",
                 leave=False,
             )
             
             for iteration in pbar:
-                # 1. 應用當前 scales
+                # 清除梯度
+                if ratio.grad is not None:
+                    ratio.grad.zero_()
+                
+                # 1. 根據當前 ratio 計算 scales
+                ratio_clamped = ratio.clamp(min=0.0, max=1.0)
+                
+                if has_weight_mean:
+                    # duo_scaling: s = x^ratio / w^(1-ratio)
+                    scales = (x_mean.pow(ratio_clamped) / (w_mean.pow(1 - ratio_clamped) + 1e-4)).clamp(min=1e-4)
+                else:
+                    # 只使用激活值: s = x^ratio
+                    scales = x_mean.pow(ratio_clamped).clamp(min=1e-4)
+                
+                # 正則化 scales
+                scales = scales / (scales.max() * scales.min()).sqrt()
                 _scalesview = scales.view(1, -1).to(device)
                 
-                # 避免數值溢出
-                scales.data[torch.isinf(scales.data)] = 1.0
-                scales.data[torch.isnan(scales.data)] = 1.0
-
-                # 2. Q(W * s) - 量化權重
+                # 2. 量化權重：Q(W * s)
                 for balance_layer in balance_layers_to_patch:
-                    if not hasattr(balance_layer, "quantization_scheme") or not hasattr(
-                        balance_layer.quantization_scheme, "weights"
-                    ):
+                    if not hasattr(balance_layer, "quantization_scheme"):
                         continue
 
                     w_qscheme = balance_layer.quantization_scheme.weights
@@ -627,7 +623,7 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
                     # 臨時修改權重：W * s
                     balance_layer.weight.mul_(_scalesview)
                     
-                    # 對於 TENSOR_GROUP (nvfp4)，需要計算 global scale
+                    # 計算 global scale
                     should_calculate_gparam = (
                         w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
                     )
@@ -659,112 +655,117 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
                 ):
                     update_fused_layer_weight_global_scales(mapping.parent)
 
-                # 4. 計算量化輸出：W * X
+                # 4. 計算量化輸出
                 int_w_outputs = self._run_samples(mapping.parent)
 
-                # 5. 計算損失：MSE(quant_output, fp16_output)
-                loss = self._compute_loss(fp16_outputs, int_w_outputs)
-
-                # 記錄初始誤差
-                if initial_error is None:
-                    initial_error = loss
-
-                # 6. 反向傳播計算梯度
-                loss.backward()
+                # 5. 使用修改後的 _compute_loss_tensor 方法計算損失
+                loss_tensor = self._compute_loss_tensor(fp16_outputs, int_w_outputs)
+                
+                # 6. 反向傳播
+                loss_tensor.backward()
                 
                 # 7. SignSGD 更新（帶動量）
                 with torch.no_grad():
-                    # 更新動量緩衝區
-                    grad = scales.grad
-                    momentum_buffer = momentum * momentum_buffer + (1 - momentum) * grad
+                    if ratio.grad is not None:
+                        # 更新動量
+                        grad = ratio.grad
+                        momentum_buffer = momentum * momentum_buffer + (1 - momentum) * grad
+                        
+                        # SignSGD 更新
+                        update = torch.sign(momentum_buffer)
+                        ratio.data -= lr * update
+                        
+                        # 確保 ratio 在 [0, 1] 範圍內
+                        ratio.data.clamp_(min=0.0, max=1.0)
                     
-                    # SignSGD 更新：使用符號
-                    update = torch.sign(momentum_buffer)
-                    scales.data -= lr * update
-                    
-                    # 確保 scales 為正
-                    scales.data.clamp_(min=1e-4)
-                    
-                    # 正則化：保持 scales 的範圍合理
-                    scales.data = scales.data / (scales.data.max() * scales.data.min()).sqrt()
+                    # 重置梯度
+                    if ratio.grad is not None:
+                        ratio.grad.zero_()
                 
-                # 8. 重置梯度
-                scales.grad.zero_()
-                
-                # 9. 恢復原始權重
+                # 8. 恢復原始權重
                 mapping.parent.load_state_dict(org_sd, strict=False)
                 
-                # 10. 記錄歷史和最佳值
-                history.append({
-                    "iteration": iteration,
-                    "error": loss.item(),
-                    "scales_mean": scales.data.mean().item(),
-                    "scales_std": scales.data.std().item(),
-                })
-                
-                if loss < best_error:
-                    best_error = loss
-                    best_scales = scales.clone().detach()
-                
                 pbar.set_postfix({
-                    "best_error": f"{best_error:.3e}",
-                    "current_error": f"{loss:.3e}",
+                    "ratio": f"{ratio_clamped.item():.3f}",
+                    "loss": f"{loss_tensor.item():.3e}",
                     "lr": f"{lr:.4f}"
                 })
 
-        # 檢查是否找到有效解
-        if best_error == float("inf") or best_scales is None:
-            logger.debug(f"SignSGD history for {mapping.smooth_name}: {history}")
-            raise Exception(
-                "No valid solution found in SignSGD optimization. This typically "
-                "means NaN values are appearing in the forward pass. "
-                "If you encounter this error consistently, raise an issue at "
-                "https://github.com/vllm-project/llm-compressor/issues"
-            )
-
-        # 計算誤差減少率
-        err_reduction = best_error / initial_error if initial_error > 0 else 1.0
+        # 使用最後的 ratio 計算最終的 scales
+        final_ratio = ratio.detach().clamp(min=0.0, max=1.0).item()
+        
+        if has_weight_mean:
+            final_scales = (x_mean.pow(final_ratio) / (w_mean.pow(1 - final_ratio) + 1e-4)).clamp(min=1e-4)
+        else:
+            final_scales = x_mean.pow(final_ratio).clamp(min=1e-4)
+        
+        # 正則化
+        final_scales = final_scales / (final_scales.max() * final_scales.min()).sqrt()
+        
+        # 清理數值
+        final_scales[torch.isnan(final_scales)] = 1.0
+        final_scales[torch.isinf(final_scales)] = 1.0
+        final_scales = torch.clamp(final_scales, min=1e-4)
+        
         logger.debug(
             f"AWQ SignSGD for {mapping.smooth_name}: "
-            f"initial error = {initial_error:.3e}, "
-            f"best error = {best_error:.3e}, "
-            f"error reduction rate (best/initial) = {err_reduction * 100:.3f}%"
+            f"final ratio = {final_ratio:.3f}, "
+            f"scales range = [{final_scales.min().item():.3e}, {final_scales.max().item():.3e}]"
         )
 
-        # 存儲錯誤指標
-        self._error_metrics.append(
-            {
-                "layer_name": mapping.smooth_name,
-                "parent_name": mapping.parent_name,
-                "method": "signsgd",
-                "iterations": 200,
-                "lr": lr,
-                "momentum": momentum,
-                "initial_error": initial_error,
-                "best_error": best_error,
-                "reduction": err_reduction,
-            }
-        )
+        # 簡單記錄
+        self._error_metrics.append({
+            "layer_name": mapping.smooth_name,
+            "final_ratio": final_ratio,
+            "final_loss": loss_tensor.item() if 'loss_tensor' in locals() else 0.0,
+        })
 
-        # 檢查 scales 的有效性
-        assert (
-            torch.isnan(best_scales).sum() == 0
-        ), f"NaN found in scales: {best_scales}"
-        assert (
-            torch.isinf(best_scales).sum() == 0
-        ), f"Inf found in scales: {best_scales}"
-        assert (
-            best_scales.min() > 0
-        ), f"Non-positive scales found: {best_scales.min()}"
+        return final_scales.detach().cpu()
 
-        return best_scales.detach().cpu()
 
+    def _compute_loss_tensor(
+        self,
+        fp16_outputs: list[torch.Tensor],
+        int_w_outputs: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        計算 MSE 損失，返回 torch.Tensor（帶計算圖）
+        """
+        device = fp16_outputs[0].device if fp16_outputs else torch.device('cpu')
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        total_elements = 0
+        
+        # 計算每個 batch 的損失
+        for fp16_batch, int_w_batch in zip(fp16_outputs, int_w_outputs):
+            # 確保 int_w_batch 在正確的設備上
+            int_w_batch = int_w_batch.to(fp16_batch.device)
+            
+            # 計算 MSE 損失
+            batch_loss = torch.nn.functional.mse_loss(
+                fp16_batch, 
+                int_w_batch, 
+                reduction='sum'
+            )
+            total_loss = total_loss + batch_loss
+            total_elements += fp16_batch.numel()
+        
+        # 正規化損失
+        if total_elements > 0:
+            total_loss = total_loss / total_elements
+        
+        return total_loss
+
+
+    # 保留原始的 _compute_loss 用於其他地方
     @torch.no_grad()
     def _compute_loss(
         self,
         fp16_outputs: list[torch.Tensor],
         int_w_outputs: list[torch.Tensor],
     ) -> float:
+        """
+        計算 MSE 損失，返回 float（用於不需要梯度的情況）
+        """
         loss = 0.0
         num_elements = 0
 
