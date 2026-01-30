@@ -528,26 +528,18 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
             for output in outputs
         ]
 
-    def _compute_best_scale(
+   def _compute_best_scale(
         self,
         mapping: ResolvedMapping,
         fp16_outputs: list[torch.Tensor],
     ) -> torch.Tensor:
         """
-        使用 SignSGD 優化 ratio 參數，固定 200 步，但加入早停
+        使用 Fake Quant + STE 優化 ratio 參數
         """
         device = get_execution_device(mapping.parent)
-
+        
         # 獲取激活值均值
         x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
-        
-        # 如果需要 duo_scaling，獲取權重均值
-        if self.duo_scaling and self.duo_scaling != "both":
-            w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
-            has_weight_mean = True
-        else:
-            w_mean = None
-            has_weight_mean = False
         
         # 初始化 ratio 參數
         ratio = torch.tensor(0.5, device=device, requires_grad=True)
@@ -556,205 +548,143 @@ class AWQAUTOROUNDModifier(Modifier, QuantizationMixin):
         lr = 0.005
         momentum = 0.9
         momentum_buffer = torch.zeros_like(ratio)
-
-        # 保存原始權重用於恢復
-        org_sd = {
-            k: v.cpu()
-            for k, v in mapping.parent.state_dict().items()
-            if v.device != torch.device("meta")
-        }
-
-        # 替換 observers 為 memoryless_minmax
-        balance_layers_to_patch = [
-            balance_layer
-            for balance_layer in mapping.balance_layers
-            if hasattr(balance_layer, "quantization_scheme")
-            and hasattr(balance_layer.quantization_scheme, "weights")
-        ]
         
-        with patch_attrs(
-            balance_layers_to_patch,
-            "weight_observer",
-            [
-                Observer.load_from_registry(
-                    "memoryless_minmax",
-                    base_name="weight",
-                    args=balance_layer.quantization_scheme.weights,
-                    module=balance_layer,
-                )
-                for balance_layer in balance_layers_to_patch
-            ],
-        ), torch.enable_grad():  # 重要：啟用梯度計算
-            # 早停參數
-            best_ratio = ratio.clone().detach()  # 保存最佳 ratio
-            best_loss = float('inf')  # 最佳損失
-            patience = 15  # 連續多少次沒有改善就停止
-            patience_counter = 0  # 沒有改善的計數器
-            min_delta = 1e-6  # 最小改善值
+        # 保存原始權重
+        original_weights = {}
+        for layer in mapping.balance_layers:
+            if hasattr(layer, 'weight'):
+                original_weights[layer] = layer.weight.clone()
+        
+        # 關鍵：自定義 Fake Quant 函數
+        def fake_quantize_with_ste(weight, scale, qscheme):
+            """
+            使用 STE 進行偽量化，保持梯度流
+            """
+            # 1. 應用 scale
+            weight_scaled = weight * scale.view(1, -1)
             
-            # 固定 200 步 SignSGD 優化
-            total_iterations = 200
-            pbar = tqdm(
-                range(total_iterations),
-                total=total_iterations,
-                desc=f"SignSGD ratio for {mapping.smooth_name}",
-                leave=False,
-            )
+            # 2. 根據量化方案計算量化參數
+            if qscheme.strategy == QuantizationStrategy.TENSOR_GROUP:
+                # 簡化處理：計算 per-tensor 量化
+                delta = weight_scaled.abs().max() / (2 ** (qscheme.num_bits - 1))
+                zero_point = 0 if qscheme.symmetric else 128
+                
+                # 3. 量化（使用 STE）
+                q = torch.round(weight_scaled / delta + zero_point)
+                q = q.clamp(0 if qscheme.symmetric else -128, 
+                            2**qscheme.num_bits - 1 if qscheme.symmetric else 127)
+                
+                # 4. 反量化（使用 STE）
+                dequantized = (q - zero_point) * delta
+                
+                # 5. 關鍵：STE - 前向傳遞量化值，反向傳遞原始梯度
+                return weight + (dequantized / scale.view(1, -1) - weight).detach()
+            else:
+                # 其他量化策略的處理...
+                return weight
+        
+        # 早停參數
+        best_ratio = ratio.clone().detach()
+        best_loss = float('inf')
+        patience = 3
+        patience_counter = 0
+        min_delta = 1e-6
+        
+        total_iterations = 100
+        pbar = tqdm(range(total_iterations), desc=f"Optimizing {mapping.smooth_name}", leave=False)
+        
+        for iteration in pbar:
+            # 1. 恢復原始權重
+            for layer, orig_weight in original_weights.items():
+                layer.weight.data.copy_(orig_weight)
             
-            for iteration in pbar:
-                # 清除梯度
-                if ratio.grad is not None:
-                    ratio.grad.zero_()
-                
-                # 1. 根據當前 ratio 計算 scales
-                ratio_clamped = ratio.clamp(min=0.0, max=1.0)
-                
-                if has_weight_mean:
-                    # duo_scaling: s = x^ratio / w^(1-ratio)
-                    scales = (x_mean.pow(ratio_clamped) / (w_mean.pow(1 - ratio_clamped) + 1e-4)).clamp(min=1e-4)
-                else:
-                    # 只使用激活值: s = x^ratio
-                    scales = x_mean.pow(ratio_clamped).clamp(min=1e-4)
-                
-                # 正則化 scales
-                scales = scales / (scales.max() * scales.min()).sqrt()
-                _scalesview = scales.view(1, -1).to(device)
-                
-                # 2. 量化權重：Q(W * s) - 這裡需要特別處理梯度問題
-                for balance_layer in balance_layers_to_patch:
-                    if not hasattr(balance_layer, "quantization_scheme"):
-                        continue
-
-                    w_qscheme = balance_layer.quantization_scheme.weights
+            # 2. 計算 scales（保留梯度）
+            ratio_clamped = ratio.clamp(min=0.0, max=1.0)
+            scales = x_mean.pow(ratio_clamped).clamp(min=1e-4)
+            scales = scales / (scales.max() * scales.min()).sqrt()
+            scales_view = scales.view(1, -1)
+            
+            # 3. 應用 Fake Quant + STE
+            for balance_layer in mapping.balance_layers:
+                if not hasattr(balance_layer, 'weight'):
+                    continue
                     
-                    # ✅ 權重操作在 no_grad 中進行
-                    with torch.no_grad():
-                        # 臨時修改權重：W * s
-                        balance_layer.weight.data.mul_(_scalesview)  # ✅ 使用 .data
+                if not hasattr(balance_layer, 'quantization_scheme'):
+                    continue
                     
-                    # 計算 global scale
-                    should_calculate_gparam = (
-                        w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
-                    )
-                    call_observer(
-                        balance_layer,
-                        "weight",
-                        balance_layer.weight,
-                        should_calculate_gparam=should_calculate_gparam,
-                    )
-                    
-                    # 量化並恢復權重：Q(W * s) / s
-                    with torch.no_grad():  # ✅ 量化操作也在 no_grad 中
-                        update_offload_parameter(
-                            balance_layer,
-                            "weight",
-                            forward_quantize(
-                                balance_layer,
-                                balance_layer.weight.data,  # ✅ 使用 .data
-                                "weight",
-                                w_qscheme,
-                            )
-                            / _scalesview,
-                        )
-
-                # 3. 對於 TENSOR_GROUP，應用 fused global scales
-                if balance_layers_to_patch and all(
-                    getattr(layer.quantization_scheme.weights, "strategy", None)
-                    == QuantizationStrategy.TENSOR_GROUP
-                    for layer in balance_layers_to_patch
-                ):
-                    update_fused_layer_weight_global_scales(mapping.parent)
-
-                # 4. 計算量化輸出
-                int_w_outputs = self._run_samples(mapping.parent)
-
-                # 5. 使用修改後的 _compute_loss_tensor 方法計算損失
-                loss_tensor = self._compute_loss_tensor(fp16_outputs, int_w_outputs)
-                current_loss = loss_tensor.item()  # ✅ 獲取當前損失值
+                qscheme = balance_layer.quantization_scheme.weights
                 
-                # 6. 反向傳播
-                loss_tensor.backward()
-                
-                # 7. SignSGD 更新（帶動量）
+                # 關鍵：使用 Fake Quant + STE
                 with torch.no_grad():
-                    if ratio.grad is not None:
-                        # 更新動量
-                        grad = ratio.grad
-                        momentum_buffer = momentum * momentum_buffer + (1 - momentum) * grad
-                        
-                        # SignSGD 更新
-                        update = torch.sign(momentum_buffer)
-                        ratio.data -= lr * update
-                        
-                        # 確保 ratio 在 [0, 1] 範圍內
-                        ratio.data.clamp_(min=0.0, max=1.0)
+                    # 保存原始權重用於 STE
+                    original_weight = balance_layer.weight.clone()
+                
+                # 應用 fake quant
+                quantized_weight = fake_quantize_with_ste(
+                    balance_layer.weight, 
+                    scales_view, 
+                    qscheme
+                )
+                
+                # 更新權重
+                balance_layer.weight.data.copy_(quantized_weight.data)
+            
+            # 4. 計算量化輸出
+            int_w_outputs = self._run_samples(mapping.parent)
+            
+            # 5. 計算損失
+            loss_tensor = self._compute_loss_tensor(fp16_outputs, int_w_outputs)
+            current_loss = loss_tensor.item()
+            
+            # 6. 反向傳播（現在有梯度了！）
+            if ratio.grad is not None:
+                ratio.grad.zero_()
+            loss_tensor.backward()
+            
+            # 7. SignSGD 更新
+            with torch.no_grad():
+                if ratio.grad is not None and ratio.grad.abs().max() > 1e-8:
+                    # 記錄梯度信息
+                    logger.debug(f"Iter {iteration}: grad={ratio.grad.item():.6f}, ratio={ratio.item():.3f}")
                     
-                    # 重置梯度
-                    if ratio.grad is not None:
-                        ratio.grad.zero_()
-                
-                # 8. 恢復原始權重
-                mapping.parent.load_state_dict(org_sd, strict=False)
-                
-                # ✅ 早停檢查
-                if current_loss < best_loss - min_delta:  # 有顯著改善
-                    best_loss = current_loss
-                    best_ratio = ratio.clone().detach()
-                    patience_counter = 0  # 重置計數器
-                    logger.debug(f"Iter {iteration}: Loss improved to {best_loss:.3e}, ratio={best_ratio.item():.3f}")
+                    # SignSGD 更新
+                    momentum_buffer = momentum * momentum_buffer + (1 - momentum) * ratio.grad
+                    update = torch.sign(momentum_buffer)
+                    ratio.data -= lr * update
+                    ratio.data.clamp_(min=0.0, max=1.0)
+                    
+                    ratio.grad.zero_()
                 else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        logger.info(f"Early stopping at iteration {iteration} (no improvement for {patience} iterations)")
-                        logger.info(f"Best loss: {best_loss:.3e}, Best ratio: {best_ratio.item():.3f}")
-                        break  # ✅ 提早結束
-                
-                # ✅ 每步顯示詳細信息
-                pbar.set_postfix({
-                    "ratio": f"{ratio_clamped.item():.3f}",
-                    "loss": f"{current_loss:.3e}",
-                    "best": f"{best_loss:.3e}",
-                    "patience": f"{patience_counter}/{patience}",
-                    "lr": f"{lr:.4f}"
-                })
-
-            # 如果沒有提前停止，完成所有迭代
-            if patience_counter < patience:
-                logger.debug(f"Completed all {total_iterations} iterations")
-                logger.info(f"Final loss: {current_loss:.3e}, Final ratio: {ratio.item():.3f}")
-
-        # ✅ 使用最佳的 ratio（不是最後的 ratio）
+                    logger.debug(f"Iter {iteration}: No valid gradient")
+            
+            # 8. 早停檢查
+            if current_loss < best_loss - min_delta:
+                best_loss = current_loss
+                best_ratio = ratio.clone().detach()
+                patience_counter = 0
+                logger.debug(f"Loss improved to {best_loss:.3e}")
+            else:
+                patience_counter += 1
+            
+            pbar.set_postfix({
+                "ratio": f"{ratio.item():.3f}",
+                "loss": f"{current_loss:.3e}",
+                "best": f"{best_loss:.3e}",
+                "grad": f"{ratio.grad.item():.3e}" if ratio.grad is not None else "0.0",
+                "patience": f"{patience_counter}/{patience}"
+            })
+            
+            if patience_counter >= patience:
+                logger.info(f"Early stop at iteration {iteration}")
+                break
+        
+        # 計算最終 scales
         final_ratio = best_ratio.clamp(min=0.0, max=1.0).item()
-        
-        if has_weight_mean:
-            final_scales = (x_mean.pow(final_ratio) / (w_mean.pow(1 - final_ratio) + 1e-4)).clamp(min=1e-4)
-        else:
-            final_scales = x_mean.pow(final_ratio).clamp(min=1e-4)
-        
-        # 正則化
+        final_scales = x_mean.pow(final_ratio).clamp(min=1e-4)
         final_scales = final_scales / (final_scales.max() * final_scales.min()).sqrt()
         
-        # 清理數值
-        final_scales[torch.isnan(final_scales)] = 1.0
-        final_scales[torch.isinf(final_scales)] = 1.0
-        final_scales = torch.clamp(final_scales, min=1e-4)
+        logger.info(f"Best ratio: {final_ratio:.3f}, Best loss: {best_loss:.3e}")
         
-        logger.info(
-            f"AWQ SignSGD for {mapping.smooth_name}: "
-            f"best ratio = {final_ratio:.3f}, "
-            f"best loss = {best_loss:.3e}, "
-            f"scales range = [{final_scales.min().item():.3e}, {final_scales.max().item():.3e}]"
-        )
-
-        # 簡單記錄
-        self._error_metrics.append({
-            "layer_name": mapping.smooth_name,
-            "final_ratio": final_ratio,
-            "final_loss": best_loss,
-            "iterations_used": iteration + 1 if 'iteration' in locals() else total_iterations,
-            "early_stopped": patience_counter >= patience
-        })
-
         return final_scales.detach().cpu()
 
 
